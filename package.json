@@ -1,0 +1,28 @@
+{
+	"name": "smart-linker",
+	"version": "0.1.0",
+	"description": "智能双链助手：一键把当前笔记中与已有笔记名/别名匹配的词转为 [[]] 双链。",
+	"main": "main.js",
+	"type": "module",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"keywords": [
+		"obsidian",
+		"plugin",
+		"wikilinks",
+		"aliases",
+		"links"
+	],
+	"author": "blime4",
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^16.11.6",
+		"builtin-modules": "^3.3.0",
+		"esbuild": "0.25.5",
+		"obsidian": "latest",
+		"tslib": "2.8.1",
+		"typescript": "5.9.3"
+	}
+}

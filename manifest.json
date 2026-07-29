@@ -1,0 +1,10 @@
+{
+	"id": "smart-linker",
+	"name": "智能双链助手",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "按下快捷键扫描当前笔记，找出与已有笔记名/别名匹配的词，一键转为 [[]] 双链（别名支持 [[笔记|显示文字]] 形式，自动跳过代码块/公式/已有链接）。",
+	"author": "blime4",
+	"authorUrl": "https://github.com/blime4",
+	"isDesktopOnly": false
+}
