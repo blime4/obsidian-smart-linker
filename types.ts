@@ -2,7 +2,7 @@ import type { TFile } from "obsidian";
 
 /** 插件设置项。 */
 export interface SmartLinkerSettings {
-	/** 参与匹配的最小���长度（短于此长度的笔记名/别名忽略）。 */
+	/** 参与匹配的最小词长度（短于此长度的笔记名/别名忽略）。 */
 	minTermLength: number;
 	/** 是否把笔记文件名作为可链接词。 */
 	includeNoteNames: boolean;
