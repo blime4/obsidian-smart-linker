@@ -6,6 +6,96 @@ export function escapeRegExp(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 统计文本行数（按 \n 计；空串为 0 行，末行无换行也算一行）。 */
+export function countLines(text: string): number {
+	if (text === "") return 0;
+	let n = 1;
+	for (let i = 0; i < text.length; i++) {
+		if (text.charCodeAt(i) === 10) n++;
+	}
+	return n;
+}
+
+/** 把 CRLF / CR 统一成 LF，便于与编辑器内部文本比对。 */
+export function normalizeNewlines(text: string): string {
+	return text.replace(/\r\n?/g, "\n");
+}
+
+/** 求两串的最长公共前缀长度。 */
+export function commonPrefixLen(a: string, b: string): number {
+	const n = Math.min(a.length, b.length);
+	let i = 0;
+	while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+	return i;
+}
+
+/** 求两串的最长公共后缀长度（不与公共前缀重叠部分计入）。 */
+export function commonSuffixLen(a: string, b: string, prefixLen: number): number {
+	const max = Math.min(a.length, b.length) - prefixLen;
+	let i = 0;
+	while (i < max && a.charCodeAt(a.length - 1 - i) === b.charCodeAt(b.length - 1 - i)) i++;
+	return i;
+}
+
+/** 返回 needle 在 hay 中所有出现位置里离 hint 最近的那个区间 [from, to)。 */
+export function findNearestOccurrence(hay: string, needle: string, hint: number): Range | null {
+	if (needle.length === 0) return null;
+	let idx = hay.indexOf(needle);
+	if (idx === -1) return null;
+	let bestIdx = idx;
+	let bestDist = Math.abs(idx - hint);
+	let guard = 0;
+	while ((idx = hay.indexOf(needle, idx + 1)) !== -1 && guard++ < 20000) {
+		const d = Math.abs(idx - hint);
+		if (d < bestDist) {
+			bestDist = d;
+			bestIdx = idx;
+		}
+	}
+	return [bestIdx, bestIdx + needle.length];
+}
+
+/**
+ * 求出「本次粘贴写入的区间」[from, to)，失败返回 null。
+ * 依次尝试：
+ *  ① 粘贴原文（换行归一后）出现在新文本中 → 取离光标最近的一处（同时可验证插入位置）。
+ *  ② 前缀/后缀 diff：变更区间即本次写入内容，可覆盖换行归一、选中替换、列表自动缩进等差异。
+ *  ③ 兜底：按「净增长长度 + 被替换长度」从光标处推算。
+ * before/after 相同表示编辑器尚未写入（事件早于写入）或粘贴被取消，返回 null 交由上层重试。
+ */
+export function locateInsertedRange(
+	before: string,
+	after: string,
+	selStart: number,
+	selLen: number,
+	raw: string,
+): Range | null {
+	const same = before === after;
+
+	const needle = normalizeNewlines(raw);
+	if (needle.length > 0) {
+		const best = findNearestOccurrence(after, needle, selStart);
+		if (best) {
+			// 文本尚未变化时，命中的必须是「就在光标附近」的那一处，避免误伤旧文本
+			if (!same || Math.abs(best[0] - selStart) <= needle.length + 200) return best;
+		}
+	}
+	if (same) return null;
+
+	const p = commonPrefixLen(before, after);
+	const s = commonSuffixLen(before, after, p);
+	const from = p;
+	const to = after.length - s;
+	if (to > from) return [from, to];
+
+	// 兜底：选中被替换时，净增长度 + 原选中长度 ≈ 写入长度
+	const inserted = after.length - before.length + selLen;
+	if (inserted <= 0) return null;
+	const start = Math.max(0, Math.min(selStart, after.length));
+	const end = Math.min(start + inserted, after.length);
+	return end > start ? [start, end] : null;
+}
+
 /** 把 frontmatter 的 aliases 值规整为字符串数组，兼容 string / array / 逗号分隔 / 数字。 */
 export function normalizeAliases(raw: unknown): string[] {
 	if (raw == null) return [];
@@ -84,7 +174,8 @@ function getFencedCodeRanges(text: string): Range[] {
 				fenceChar = open[1][0];
 			}
 		} else {
-			const close = line.match(/^[ \t]*(`{3,}|~{3,})[ \t]*$/);
+			// 行切片含行尾 \r\n，而 $ 锚点只匹配串尾，须先剥掉才能识别闭合围栏
+			const close = line.replace(/[\r\n]+$/, "").match(/^[ \t]*(`{3,}|~{3,})[ \t]*$/);
 			if (close && close[1][0] === fenceChar) {
 				ranges.push([fenceStart, le]);
 				fenceStart = -1;
@@ -93,6 +184,32 @@ function getFencedCodeRanges(text: string): Range[] {
 		}
 	}
 	if (fenceStart !== -1) ranges.push([fenceStart, text.length]);
+	return ranges;
+}
+
+/**
+ * 结构性行：水平分割线（--- / *** / ___）与表格分隔行（|---|---|）。
+ * 这些行的字符（成组的 - 、| 等）不是正文，命中也不应被链接。
+ */
+function getStructuralRanges(text: string): Range[] {
+	const ranges: Range[] = [];
+	const lineStarts = getLineOffsets(text);
+	const n = lineStarts.length;
+	for (let i = 0; i < n; i++) {
+		const ls = lineStarts[i];
+		const le = i + 1 < n ? lineStarts[i + 1] : text.length;
+		// 行切片含行尾 \r\n，先剥掉再匹配（同围栏闭合的教训）
+		const line = text.slice(ls, le).replace(/[\r\n]+$/, "");
+		// 水平分割线：≥3 个连续 - / * / _
+		if (/^ *(-{3,}|\*{3,}|_{3,}) *$/.test(line)) {
+			ranges.push([ls, le]);
+			continue;
+		}
+		// 表格分隔行：整行仅由 | : - 与空白组成，且同时含 - 与 |
+		if (line.includes("-") && line.includes("|") && /^ *\|?[ \t:|-]*$/.test(line)) {
+			ranges.push([ls, le]);
+		}
+	}
 	return ranges;
 }
 
@@ -115,18 +232,26 @@ function mergeRanges(ranges: Range[]): Range[] {
 /**
  * 计算所有「受保护」区间：frontmatter、围栏代码块、行内代码、数学公式、
  * 已有 wikilink/embed、Markdown 链接、HTML 标签。落在其中的命中不会被链接。
+ * opts.excludeInlineCode=true 时跳过行内代码区间；opts.excludeWikilinks=true 时跳过 wikilink 区间
+ * （用于「行内代码内转链」「失效链接重写」需要单独判断的场景）。
  */
-export function computeProtectedRanges(text: string): Range[] {
+export function computeProtectedRanges(
+	text: string,
+	opts?: { excludeInlineCode?: boolean; excludeWikilinks?: boolean },
+): Range[] {
 	const ranges: Range[] = [];
 	const fm = getFrontmatterRange(text);
 	if (fm) ranges.push(fm);
 	ranges.push(...getFencedCodeRanges(text));
+	ranges.push(...getStructuralRanges(text));
 
 	// 行内代码
 	let m: RegExpExecArray | null;
-	const codeRe = /`[^`\n]+`/g;
-	while ((m = codeRe.exec(text)) !== null) {
-		ranges.push([m.index, m.index + m[0].length]);
+	if (!opts?.excludeInlineCode) {
+		const codeRe = /`[^`\n]+`/g;
+		while ((m = codeRe.exec(text)) !== null) {
+			ranges.push([m.index, m.index + m[0].length]);
+		}
 	}
 	// 块级数学 $$...$$
 	const blockMathRe = /\$\$[\s\S]*?\$\$/g;
@@ -141,9 +266,11 @@ export function computeProtectedRanges(text: string): Range[] {
 		ranges.push([m.index, m.index + m[0].length]);
 	}
 	// wikilink 与 embed：[[...]] / ![[...]]
-	const wikiRe = /!?\[\[[^\]\n]*\]\]/g;
-	while ((m = wikiRe.exec(text)) !== null) {
-		ranges.push([m.index, m.index + m[0].length]);
+	if (!opts?.excludeWikilinks) {
+		const wikiRe = /!?\[\[[^\]\n]*\]\]/g;
+		while ((m = wikiRe.exec(text)) !== null) {
+			ranges.push([m.index, m.index + m[0].length]);
+		}
 	}
 	// Markdown 链接 [text](url)
 	const mdLinkRe = /\[[^\]\n]*\]\([^)\n]*\)/g;

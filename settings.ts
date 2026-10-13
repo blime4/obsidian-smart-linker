@@ -2,6 +2,7 @@ import type { App } from "obsidian";
 import { PluginSettingTab, Setting } from "obsidian";
 import { DEFAULT_SETTINGS } from "./types";
 import type SmartLinkerPlugin from "./main";
+import { TagSelectModal } from "./tag-modal";
 
 /** 插件设置页（中文）。 */
 export class SmartLinkerSettingTab extends PluginSettingTab {
@@ -34,6 +35,65 @@ export class SmartLinkerSettingTab extends PluginSettingTab {
 					}
 				});
 			});
+
+		new Setting(containerEl).setName("粘贴自动双链").setHeading();
+		new Setting(containerEl)
+			.setName("粘贴后自动双链")
+			.setDesc(
+				`开启后，粘贴进笔记的内容行数超过下方阈值时，会自动扫描并把命中的笔记名/别名转为 [[双链]]，无需再按快捷键。可在「快捷键」中给命令「切换：粘贴后自动双链」绑定一个开关热键。（当前${s.autoLinkOnPaste ? "已开启" : "已关闭"}）`,
+			)
+			.addToggle((t) => t.setValue(s.autoLinkOnPaste).onChange(async (v) => { s.autoLinkOnPaste = v; await this.plugin.saveSettings(); }));
+
+		new Setting(containerEl)
+			.setName("触发行数")
+			.setDesc("粘贴内容的行数「严格大于」该值时才触发自动双链。默认 5，即粘贴 6 行及以上触发。")
+			.addText((t) => {
+				t.inputEl.type = "number";
+				t.setValue(String(s.autoLinkMinLines));
+				t.onChange(async (v) => {
+					const n = parseInt(v, 10);
+					s.autoLinkMinLines = Number.isFinite(n) && n >= 0 ? n : DEFAULT_SETTINGS.autoLinkMinLines;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("处理范围")
+			.setDesc("「只处理粘贴内容」更安全，只给本次粘贴进来的文字建链；「整篇笔记」会连同笔记里其余文字一起建链。")
+			.addDropdown((d) =>
+				d
+					.addOption("pasted", "只处理粘贴的内容")
+					.addOption("note", "整篇笔记")
+					.setValue(s.autoLinkScope)
+					.onChange(async (v) => {
+						s.autoLinkScope = v === "note" ? "note" : "pasted";
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("落地方式")
+			.setDesc("「直接写入」按默认目标静默建链（一次 Ctrl+Z 可整体撤销）；「弹窗确认」会先弹出候选列表让你勾选。")
+			.addDropdown((d) =>
+				d
+					.addOption("apply", "直接写入")
+					.addOption("confirm", "弹窗确认")
+					.setValue(s.autoLinkMode)
+					.onChange(async (v) => {
+						s.autoLinkMode = v === "confirm" ? "confirm" : "apply";
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("跳过歧义词")
+			.setDesc("某个词同时对应多篇笔记时不自动建链，留给手动触发处理，避免链错目标。")
+			.addToggle((t) => t.setValue(s.autoLinkSkipAmbiguous).onChange(async (v) => { s.autoLinkSkipAmbiguous = v; await this.plugin.saveSettings(); }));
+
+		new Setting(containerEl)
+			.setName("显示结果提示")
+			.setDesc("自动建链后弹出提示，告知创建了多少处链接。")
+			.addToggle((t) => t.setValue(s.autoLinkShowNotice).onChange(async (v) => { s.autoLinkShowNotice = v; await this.plugin.saveSettings(); }));
 
 		new Setting(containerEl).setName("匹配范围").setHeading();
 		new Setting(containerEl)
@@ -69,20 +129,46 @@ export class SmartLinkerSettingTab extends PluginSettingTab {
 			.setDesc("不把当前正在编辑的笔记名/别名作为链接目标。")
 			.addToggle((t) => t.setValue(s.excludeCurrentNote).onChange(async (v) => { s.excludeCurrentNote = v; await this.plugin.saveSettings(); }));
 
-		new Setting(containerEl)
+		const tagSetting = new Setting(containerEl)
 			.setName("排除标签（tags）")
-			.setDesc("带这些标签的笔记不作为链接目标，多个用逗号分隔。支持层级前缀，如填 private 会同时排除 #private 与 #private/工作。")
-			.addText((t) => {
-				t.setPlaceholder("例如：private, secret");
-				t.setValue(s.excludedTags.join(", "));
-				t.onChange(async (v) => {
-					s.excludedTags = v
-						.split(",")
-						.map((x) => x.trim().replace(/^#/, ""))
-						.filter((x) => x !== "");
+			.setDesc("带这些标签的笔记不作为链接目标。支持层级前缀，如 private 会同时排除 #private 与 #private/工作。");
+
+		const tagChipBar = tagSetting.descEl.parentElement!.createDiv();
+		tagChipBar.style.marginTop = "8px";
+		tagChipBar.style.display = "flex";
+		tagChipBar.style.flexWrap = "wrap";
+		tagChipBar.style.gap = "4px";
+		tagChipBar.style.alignItems = "center";
+
+		const renderChips = (): void => {
+			tagChipBar.empty();
+			for (const t of s.excludedTags) {
+				const chip = tagChipBar.createEl("span");
+				chip.setText(`#${t}`);
+				chip.style.cssText =
+					"display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:var(--font-ui-smaller);background:var(--tag-bg);color:var(--tag-color);";
+				const x = chip.createEl("span");
+				x.setText("×");
+				x.style.cssText = "cursor:pointer;font-weight:bold;opacity:.6;";
+				x.addEventListener("click", async () => {
+					s.excludedTags = s.excludedTags.filter((e) => e !== t);
 					await this.plugin.saveSettings();
+					renderChips();
 				});
+			}
+			const addBtn = tagChipBar.createEl("button");
+			addBtn.setText("+ 选择标签");
+			addBtn.style.cssText = "font-size:var(--font-ui-smaller);padding:2px 10px;";
+			addBtn.addEventListener("click", () => {
+				new TagSelectModal(this.app, s.excludedTags, async (tags) => {
+					s.excludedTags = tags;
+					await this.plugin.saveSettings();
+					renderChips();
+				}).open();
 			});
+		};
+
+		renderChips();
 
 		new Setting(containerEl)
 			.setName("区分大小写")
@@ -96,7 +182,17 @@ export class SmartLinkerSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("跳过特殊区域")
-			.setDesc("不在代码块、行内代码、数学公式、已有 [[链接]]、Markdown 链接和 HTML 标签内创建链接。")
+			.setDesc("不在代码块、数学公式、已有 [[链接]]、Markdown 链接和 HTML 标签内创建链接（行内代码由下方开关单独控制）。")
 			.addToggle((t) => t.setValue(s.protectSpecialRanges).onChange(async (v) => { s.protectSpecialRanges = v; await this.plugin.saveSettings(); }));
+
+		new Setting(containerEl)
+			.setName("行内代码内转链")
+			.setDesc("开启时，`EagleDraftWorker`（反引号内整段等于某笔记名/别名）可连同反引号一起转成 [[EagleDraftWorker]]；代码块与其余特殊区域仍跳过。")
+			.addToggle((t) => t.setValue(s.linkInlineCode).onChange(async (v) => { s.linkInlineCode = v; await this.plugin.saveSettings(); }));
+
+		new Setting(containerEl)
+			.setName("失效 [[链接]] 重写")
+			.setDesc("开启时，指向不存在笔记、但命中某笔记别名的 [[链接]] 会被列出并重写，如 [[EAGLE]] → [[EAGLE-3|EAGLE]]。")
+			.addToggle((t) => t.setValue(s.fixBrokenLinks).onChange(async (v) => { s.fixBrokenLinks = v; await this.plugin.saveSettings(); }));
 	}
 }
