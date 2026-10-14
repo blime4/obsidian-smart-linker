@@ -8,13 +8,16 @@ import {
 import { applyReplacements, buildIndex, buildReplacements, scan, scanText } from "./linker";
 import {
 	applyExcalidraw,
+	clipboardHasImageOrFile,
 	elementRawText,
 	ensureZeroLayoutFrontmatter,
 	getActiveExcalidrawView,
 	getExcalidrawAutomate,
 	getLinkDecoration,
+	hasPendingImages,
 	isEditingTextInView,
 	scanExcalidraw,
+	sceneSignature,
 	type ExcalidrawApi,
 	type ExcalidrawElement,
 	type ExcalidrawSource,
@@ -327,6 +330,10 @@ export default class SmartLinkerPlugin extends Plugin {
 	 * 画板粘贴入口。Excalidraw 没有「粘贴完成」事件，且粘贴在画布上（新建文本元素）
 	 * 与在文本框内编辑（提交后才落到元素上）时序不同，因此统一用轮询比对场景变化：
 	 * 找到「新增的 / 内容变化且包含粘贴片段」的文本元素，等编辑结束后自动建链，只处理一次。
+	 *
+	 * 两道闸门保证不干扰 Excalidraw 自己插图片：
+	 * ① 剪贴板里带图片/文件 → 直接不介入（写回会整体覆盖场景，可能把图片冲掉）；
+	 * ② 轮询时要求场景指纹连续两次一致、且没有未就绪的图片元素，才动手写回。
 	 */
 	private onExcalidrawPaste(evt: ClipboardEvent): void {
 		const s = this.settings;
@@ -335,6 +342,9 @@ export default class SmartLinkerPlugin extends Plugin {
 		const target = evt.target as Node | null;
 		const view = getActiveExcalidrawView(this.app);
 		if (!view || !target || !view.containerEl.contains(target)) return;
+
+		// ① 带图片/文件的粘贴交给 Excalidraw 自己处理，本插件完全不介入。
+		if (s.autoLinkSkipImagePaste && clipboardHasImageOrFile(evt.clipboardData)) return;
 
 		const raw = evt.clipboardData?.getData("text/plain") ?? "";
 		if (raw.trim() === "" || countLines(raw) <= s.autoLinkMinLines) return;
@@ -347,14 +357,44 @@ export default class SmartLinkerPlugin extends Plugin {
 		if (snippet === "") return;
 
 		let tries = 0;
+		let lastSig = "";
+		let stableTicks = 0;
 		const timer = window.setInterval(() => {
 			tries++;
-			if (tries > 40 || !view.containerEl.isConnected) {
+			if (tries > 75 || !view.containerEl.isConnected) {
 				window.clearInterval(timer);
 				return;
 			}
 			// 还在文本框里编辑 → 等提交后再处理，避免和 Excalidraw 的文本编辑器打架
-			if (isEditingTextInView(view)) return;
+			if (isEditingTextInView(view)) {
+				stableTicks = 0;
+				return;
+			}
+
+			let elements: ExcalidrawElement[] = [];
+			try {
+				elements = ea.getViewElements() ?? [];
+			} catch {
+				stableTicks = 0;
+				return;
+			}
+			// ② 图片还没就绪（正在下载/解析）→ 先等 Excalidraw 插完，别把半成品冲掉
+			if (hasPendingImages(elements)) {
+				stableTicks = 0;
+				lastSig = "";
+				return;
+			}
+			// ② 场景指纹要和上一次完全一致，才认为 Excalidraw 自己的插入已经结束
+			const sig = sceneSignature(elements);
+			if (sig !== lastSig) {
+				lastSig = sig;
+				stableTicks = 0;
+				return;
+			}
+			if (stableTicks < 1) {
+				stableTicks++;
+				return;
+			}
 
 			const changed = this.findPastedElements(ea, before, snippet, s.autoLinkMinLines);
 			if (changed.length === 0) return;
@@ -444,7 +484,16 @@ export default class SmartLinkerPlugin extends Plugin {
 			candidate: c,
 			targetIndex: c.defaultTargetIndex,
 		}));
-		const n = await applyExcalidraw(ea, sels, { forceAlias: s.eaAliasAlways });
+		// 自动路径是 fire-and-forget 的：异常若逃出去会变成未处理的 rejection，
+		// 且不该因为「建链失败」而干扰用户正在做的粘贴/插图。这里全部兜住。
+		let n = 0;
+		try {
+			n = await applyExcalidraw(ea, sels, { forceAlias: s.eaAliasAlways });
+		} catch (e) {
+			console.warn("[智能双链助手] 画板粘贴自动双链写入失败：", e);
+			if (s.autoLinkShowNotice) new Notice("画板粘贴自动双链：写入失败，已跳过（不影响已粘贴的内容）");
+			return;
+		}
 		if (n <= 0) return;
 		const hint = await this.linkDecorationHint(ea);
 		if (s.autoLinkShowNotice) {

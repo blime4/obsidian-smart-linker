@@ -1,6 +1,6 @@
 {
 	"name": "smart-linker",
-	"version": "0.4.0",
+	"version": "0.4.1",
 	"description": "智能双链助手：把当前笔记中与已有笔记名/别名匹配的词转为 [[]] 双链；粘贴内容行数超阈值时自动建链（Markdown 与 Excalidraw 画板都支持）。",
 	"main": "main.js",
 	"type": "module",

@@ -2,9 +2,12 @@ import type { App } from "obsidian";
 import { applyToString, buildIndex, buildReplacements, scanText } from "./linker";
 import {
 	applyExcalidraw,
+	clipboardHasImageOrFile,
 	elementRawText,
 	ensureZeroLayoutFrontmatter,
 	getLinkDecoration,
+	hasPendingImages,
+	sceneSignature,
 	type ExcalidrawApi,
 	type ExcalidrawElement,
 } from "./excalidraw";
@@ -200,6 +203,109 @@ console.log("\napplyToString 倒序拼接：");
 	const cands = scanText(src, index, S, { protect: true });
 	const reps = buildReplacements(src, cands[0], 0, { forceAlias: true });
 	eq("替换结果", applyToString(src, reps), "a [[EAGLE-3|EAGLE]] b");
+}
+
+console.log("\n剪贴板含图片/文件判定（带图片时本插件不介入）：");
+{
+	const mk = (files: unknown[], items: unknown[]): DataTransfer => ({ files, items } as unknown as DataTransfer);
+	eq("files 非空 → true", clipboardHasImageOrFile(mk([{}], [])), true);
+	eq("items 里有 kind=file → true", clipboardHasImageOrFile(mk([], [{ kind: "file", type: "image/png" }])), true);
+	eq("纯文本 → false", clipboardHasImageOrFile(mk([], [{ kind: "string", type: "text/plain" }])), false);
+	eq("空 items → false", clipboardHasImageOrFile(mk([], [])), false);
+	eq("null → false", clipboardHasImageOrFile(null), false);
+	const boom = {
+		get files(): never {
+			throw new Error("denied");
+		},
+	} as unknown as DataTransfer;
+	eq("读取抛错时按「没有图片」处理", clipboardHasImageOrFile(boom), false);
+}
+
+console.log("\n未就绪图片检测（阻止写回冲掉正在插入的图片）：");
+{
+	eq("普通文本元素 → false", hasPendingImages([{ id: "t", type: "text", text: "hi" }]), false);
+	eq("图片已就绪 → false", hasPendingImages([{ id: "i", type: "image", status: "saved", fileId: "f1" }]), false);
+	eq("图片 status=pending → true", hasPendingImages([{ id: "i", type: "image", status: "pending", fileId: "f1" }]), true);
+	eq("图片 status=loading → true", hasPendingImages([{ id: "i", type: "image", status: "loading", fileId: "f1" }]), true);
+	eq("图片 status=error → true", hasPendingImages([{ id: "i", type: "image", status: "error", fileId: "f1" }]), true);
+	eq("图片缺 fileId → true", hasPendingImages([{ id: "i", type: "image", status: "saved" }]), true);
+	eq("已删除的 pending 图片忽略 → false", hasPendingImages([{ id: "i", type: "image", status: "pending", isDeleted: true }]), false);
+}
+
+console.log("\n场景指纹（连续两次一致才允许写回）：");
+{
+	const a = [
+		{ id: "t1", type: "text", version: 1 },
+		{ id: "i1", type: "image", version: 3 },
+	];
+	const b = [
+		{ id: "i1", type: "image", version: 3 },
+		{ id: "t1", type: "text", version: 1 },
+	];
+	eq("元素顺序无关 → 指纹相同", sceneSignature(a), sceneSignature(b));
+	eq("元素版本变化 → 指纹不同", sceneSignature(a) === sceneSignature([{ id: "t1", type: "text", version: 2 }, { id: "i1", type: "image", version: 3 }]), false);
+	eq("新增元素 → 指纹不同", sceneSignature(a) === sceneSignature([...a, { id: "n1", type: "text", version: 1 }]), false);
+	eq("已删除元素不参与", sceneSignature([{ id: "x", type: "text", version: 1, isDeleted: true }]), sceneSignature([]));
+	eq("空场景", sceneSignature([]), "0|");
+}
+
+console.log("\n写回加固：EA 取不到元素副本时不写、不抛（宁可跳过，也不写坏画板）");
+{
+	const el: ExcalidrawElement = { id: "el9", type: "text", text: "EAGLE", rawText: "EAGLE" };
+	const ea = {
+		getViewElements: () => [el],
+		getViewSelectedElements: () => [],
+		getElement: () => undefined,
+		copyViewElementsToEAforEditing: () => {},
+		addElementsToView: async () => true,
+	} as unknown as ExcalidrawApi;
+	eq("返回 0", await applyExcalidraw(ea, select(el), { forceAlias: true }), 0);
+	eq("view 里的元素未被改动", el.rawText, "EAGLE");
+}
+
+console.log("\n写回加固：元素是冻结对象时也不抛（旧实现的回退写入会在这里炸）");
+{
+	const el = Object.freeze({ id: "elF", type: "text", text: "EAGLE", rawText: "EAGLE" }) as ExcalidrawElement;
+	const ea = {
+		getViewElements: () => [el],
+		getViewSelectedElements: () => [],
+		getElement: () => undefined,
+		copyViewElementsToEAforEditing: () => {},
+		addElementsToView: async () => true,
+	} as unknown as ExcalidrawApi;
+	let threw = false;
+	let n = -1;
+	try {
+		n = await applyExcalidraw(ea, select(el), { forceAlias: true });
+	} catch {
+		threw = true;
+	}
+	eq("不抛异常", threw, false);
+	eq("返回 0", n, 0);
+	eq("冻结元素保持原样", el.rawText, "EAGLE");
+}
+
+console.log("\n写回加固：copyViewElementsToEAforEditing 抛错 → 返回 0，不抛");
+{
+	const el: ExcalidrawElement = { id: "elC", type: "text", text: "EAGLE", rawText: "EAGLE" };
+	const ea = {
+		getViewElements: () => [el],
+		getViewSelectedElements: () => [],
+		getElement: () => el,
+		copyViewElementsToEAforEditing: () => {
+			throw new Error("boom");
+		},
+		addElementsToView: async () => true,
+	} as unknown as ExcalidrawApi;
+	let threw = false;
+	let n = -1;
+	try {
+		n = await applyExcalidraw(ea, select(el), { forceAlias: true });
+	} catch {
+		threw = true;
+	}
+	eq("不抛异常", threw, false);
+	eq("返回 0", n, 0);
 }
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);

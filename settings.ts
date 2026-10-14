@@ -101,6 +101,17 @@ export class SmartLinkerSettingTab extends PluginSettingTab {
 			.setDesc("在 Excalidraw 画板上粘贴超过阈值的多行文本时也自动建链（含粘贴后在文本框里编辑、提交生效的情况）。需上方「粘贴后自动双链」总开关为开。")
 			.addToggle((t) => t.setValue(s.autoLinkExcalidrawOnPaste).onChange(async (v) => { s.autoLinkExcalidrawOnPaste = v; await this.plugin.saveSettings(); }));
 
+		new Setting(containerEl)
+			.setName("粘贴带图片时跳过（推荐开启）")
+			.setDesc(
+				[
+					"粘贴内容里含图片/文件时，交回给 Excalidraw 自己插入，本插件不介入。",
+					"原因：本插件的写回会用「开始写之前的整份画板快照」整体覆盖，若此刻 Excalidraw 正在把图片放进画板，图片会被冲掉（表现为「插入图片失败」或图片一闪就没了）。",
+					"关闭后，带图片的粘贴也会尝试自动双链，插入图片可能因此失败。",
+				].join("\n"),
+			)
+			.addToggle((t) => t.setValue(s.autoLinkSkipImagePaste).onChange(async (v) => { s.autoLinkSkipImagePaste = v; await this.plugin.saveSettings(); }));
+
 		new Setting(containerEl).setName("Excalidraw 画板").setHeading();
 
 		new Setting(containerEl)

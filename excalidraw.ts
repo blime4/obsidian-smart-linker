@@ -120,6 +120,60 @@ export function elementRawText(el: ExcalidrawElement): string {
 	return typeof raw === "string" && raw !== "" ? raw : el.text ?? "";
 }
 
+/**
+ * 剪贴板里是否带图片/文件。
+ *
+ * 这类粘贴必须交回给 Excalidraw 自己处理：本插件的写回走
+ * `copyViewElementsToEAforEditing` + `addElementsToView`，而后者会用
+ * 「调用开始时抓取的整份场景快照 + 新元素」整体 `updateScene` 覆盖写回；
+ * 若此刻 Excalidraw 正在把图片元素放进场景，就会被这份旧快照冲掉
+ * （表现为「图片插入失败 / 图片一闪就没了」）。因此带图片的粘贴直接不介入。
+ */
+export function clipboardHasImageOrFile(data: DataTransfer | null): boolean {
+	if (!data) return false;
+	try {
+		if (data.files && data.files.length > 0) return true;
+		const items = data.items;
+		if (items) {
+			for (let i = 0; i < items.length; i++) {
+				if (items[i]?.kind === "file") return true;
+			}
+		}
+	} catch {
+		/* 忽略：读不到剪贴板内容时按「没有图片」处理 */
+	}
+	return false;
+}
+
+/**
+ * 场景里是否存在「尚未就绪」的图片元素（正在下载/解析，或还没有 fileId）。
+ * 此时写回会把未完成的图片一起覆盖掉，应等待。
+ */
+export function hasPendingImages(elements: ExcalidrawElement[]): boolean {
+	for (const el of elements) {
+		if (!el || el.isDeleted || el.type !== "image") continue;
+		const status = (el as { status?: string }).status;
+		if (status === "pending" || status === "loading" || status === "error") return true;
+		if (!(el as { fileId?: string }).fileId) return true;
+	}
+	return false;
+}
+
+/**
+ * 场景指纹：参与匹配的元素 id + 版本 + 类型（含非文本元素）。
+ * 用于判断「场景是否已经稳定」——只有连续两次轮询指纹一致，
+ * 才认为 Excalidraw 自身的粘贴/插入已经结束，这时写回才安全。
+ */
+export function sceneSignature(elements: ExcalidrawElement[]): string {
+	const parts: string[] = [];
+	for (const el of elements) {
+		if (!el || el.isDeleted) continue;
+		parts.push(`${el.id}:${String((el as { version?: number }).version ?? "")}:${el.type}`);
+	}
+	parts.sort();
+	return `${parts.length}|${parts.join(",")}`;
+}
+
 function isTextElement(el: ExcalidrawElement | null | undefined): boolean {
 	return !!el && el.type === "text" && !el.isDeleted;
 }
@@ -189,6 +243,12 @@ export function scanExcalidraw(
  * 画布最终显示成什么样，取决于 Excalidraw 自身的两个设置（可用 frontmatter 按画板覆盖）：
  * `excalidraw-link-brackets`（是否显示 `[[]]`）与 `excalidraw-link-prefix`（链接前缀，如 📍）。
  * 两者都为「否 / 空」时，`[[笔记名|原文]]` 的展示文字恰好等于原文 → 真正的排版零变化。
+ *
+ * **并发安全**：`addElementsToView` 会用「调用开始时抓取的整份场景快照 + 新元素」
+ * 整体覆盖写回，中间还夹着 `await`。所以本函数只应在场景稳定时被调用
+ * （调用方先用 `hasPendingImages` / `sceneSignature` 判定），否则可能把
+ * 并发插入的图片元素一起覆盖掉。若 Excalidraw 正在插入带图片的粘贴，
+ * 调用方应直接不介入（见 `clipboardHasImageOrFile`）。
  */
 export async function applyExcalidraw(
 	ea: ExcalidrawApi,
@@ -225,12 +285,35 @@ export async function applyExcalidraw(
 		return 0;
 	}
 
+	// 只写 ExcalidrawAutomate 里的副本，**绝不回退到 view 里的元素对象**：
+	// view 的元素可能是只读/冻结的，赋值会直接抛异常；而且不在 EA 注册表里的对象
+	// 改了也不会被写回。拿不到就跳过该元素（宁可不写，也不能把画板写坏）。
+	let written = 0;
 	for (const p of plan) {
-		const el = ea.getElement?.(p.id) ?? byId.get(p.id)!.element;
+		let el: ExcalidrawElement | undefined;
+		try {
+			el = ea.getElement?.(p.id);
+		} catch {
+			el = undefined;
+		}
 		if (!el) continue;
-		// 只动这两个字段，其余交给 Excalidraw 派生
-		el.rawText = p.raw;
-		el.originalText = p.raw;
+		try {
+			// 只动这两个字段，其余（text / 位置 / 尺寸）交给 Excalidraw 从 rawText 派生
+			el.rawText = p.raw;
+			el.originalText = p.raw;
+			written++;
+		} catch {
+			/* 单个元素写不进去，不影响其余元素 */
+		}
+	}
+
+	if (written === 0) {
+		try {
+			ea.destroy?.();
+		} catch {
+			/* 忽略 */
+		}
+		return 0;
 	}
 
 	try {
@@ -245,7 +328,7 @@ export async function applyExcalidraw(
 			/* 忽略 */
 		}
 	}
-	return plan.length;
+	return written;
 }
 
 // ─────────────────── 链接装饰（📍 前缀 / [[ ]] 方括号）───────────────────

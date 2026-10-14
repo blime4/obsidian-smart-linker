@@ -36,6 +36,12 @@ export interface SmartLinkerSettings {
 	autoLinkShowNotice: boolean;
 	/** Excalidraw 画板上粘贴多行文本后是否也自动双链。 */
 	autoLinkExcalidrawOnPaste: boolean;
+	/**
+	 * 粘贴内容里带图片/文件时不自动双链（默认开）。
+	 * 这类粘贴交给 Excalidraw 自己插入图片；本插件的写回会用旧场景快照整体覆盖，
+	 * 可能在图片尚未落盘时把它冲掉（表现为「插入图片失败」）。
+	 */
+	autoLinkSkipImagePaste: boolean;
 	/** Excalidraw 写入时总是用 [[笔记名|原文]]：双链的显示文字取「原文」，画布文字不会变成笔记名。 */
 	eaAliasAlways: boolean;
 	/**
@@ -66,6 +72,7 @@ export const DEFAULT_SETTINGS: SmartLinkerSettings = {
 	autoLinkSkipAmbiguous: false,
 	autoLinkShowNotice: true,
 	autoLinkExcalidrawOnPaste: true,
+	autoLinkSkipImagePaste: true,
 	eaAliasAlways: true,
 	eaZeroLayout: false,
 };
