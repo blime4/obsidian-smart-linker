@@ -275,12 +275,21 @@ function isTableCellLine(text: string, from: number, to: number): boolean {
 	return /^\s*(?:>\s*)*\|/.test(text.slice(lineStart, lineEnd));
 }
 
-/** 为某个候选 + 选定目标生成全部替换（相同用 [[name]]，不同用 [[name|原文]]；表格行内转义 |）。 */
-export function buildReplacements(text: string, candidate: MatchCandidate, targetIndex: number): Replacement[] {
+/**
+ * 为某个候选 + 选定目标生成全部替换。
+ * opts.forceAlias=true 时总是写成 `[[笔记名|原文]]`（Excalidraw 用：展示文本与原文一致，排版零变化）。
+ * opts.escapeTable=false 时不做表格管道转义（Excalidraw 画板里没有 Markdown 表格）。
+ */
+export function buildReplacements(
+	text: string,
+	candidate: MatchCandidate,
+	targetIndex: number,
+	opts: { forceAlias?: boolean; escapeTable?: boolean } = {},
+): Replacement[] {
 	const target = candidate.targets[targetIndex] ?? candidate.targets[0];
 	const out: Replacement[] = [];
 	for (const occ of candidate.occurrences) {
-		const inTable = isTableCellLine(text, occ.from, occ.to);
+		const inTable = opts.escapeTable !== false && isTableCellLine(text, occ.from, occ.to);
 		const sep = inTable ? "\\|" : "|";
 		// 已有 wikilink 的失效链接重写：整段替换为 [[新笔记名(后缀)|原显示]]
 		if (occ.link) {
@@ -295,7 +304,7 @@ export function buildReplacements(text: string, candidate: MatchCandidate, targe
 		// 行内代码整段命中的原文含反引号，比对与别名展示都按去掉反引号后的内容算
 		let matched = text.substring(occ.from, occ.to);
 		if (occ.inCode) matched = matched.slice(1, -1);
-		if (matched === target.noteName) {
+		if (matched === target.noteName && !opts.forceAlias) {
 			out.push({ from: occ.from, to: occ.to, text: `[[${target.noteName}]]` });
 			continue;
 		}
@@ -303,6 +312,15 @@ export function buildReplacements(text: string, candidate: MatchCandidate, targe
 		out.push({ from: occ.from, to: occ.to, text: `[[${target.noteName}${sep}${matched}]]` });
 	}
 	return out;
+}
+
+/** 取双链的「显示文字」：`[[目标|显示]]` → 显示，`[[目标]]` → 目标；非双链原样返回。 */
+export function linkDisplayText(link: string): string {
+	const m = /^!?\[\[([^\]\n]*)\]\]$/.exec(link);
+	if (!m) return link;
+	const inner = m[1];
+	const pipe = inner.indexOf("|");
+	return pipe === -1 ? inner : inner.slice(pipe + 1);
 }
 
 /** 把替换应用到纯文本字符串（倒序拼接），返回新字符串。用于 Excalidraw 文本元素。 */

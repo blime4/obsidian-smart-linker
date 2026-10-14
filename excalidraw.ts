@@ -1,4 +1,4 @@
-import { ItemView, type App } from "obsidian";
+import { ItemView, type App, type TFile } from "obsidian";
 import type { CandidateSelection, MatchCandidate, Replacement, SmartLinkerSettings } from "./types";
 import { applyToString, buildIndex, buildReplacements, scanText } from "./linker";
 
@@ -6,112 +6,321 @@ import { applyToString, buildIndex, buildReplacements, scanText } from "./linker
 export interface ExcalidrawElement {
 	id: string;
 	type: string;
+	/** 画布上实际渲染的文本（链接已被替换为显示文字）。 */
 	text?: string;
+	/** 用户键入的原始文本（含 [[链接]]），Excalidraw 插件以此为解析源。 */
 	rawText?: string;
-	link?: string;
+	/** 与 rawText 同义的历史字段，插件会读它。 */
+	originalText?: string;
+	/** 绑定到容器（矩形/椭圆/箭头标签）时指向容器 id。 */
+	containerId?: string | null;
+	link?: string | null;
+	isDeleted?: boolean;
 	[key: string]: unknown;
 }
 
 /** Excalidraw 文本元素的来源上下文（挂在 candidate.source 上）。 */
 export interface ExcalidrawSource {
 	element: ExcalidrawElement;
-	/** 原始文本快照（用于按偏移生成替换）。 */
+	/** 参与匹配的原文快照（rawText 优先）。 */
 	text: string;
 }
 
-export interface ExcalidrawScanResult {
-	ea: unknown;
-	candidates: MatchCandidate[];
+/**
+ * ExcalidrawAutomate 中本插件用到的子集。
+ * 注意：这些方法在 ExcalidrawAutomate（ea）上，**不在** view.excalidrawAPI 上
+ *（后者只有 getSceneElements / updateScene / getAppState / selectElements 等）。
+ */
+export interface ExcalidrawApi {
+	targetView?: ItemView;
+	getViewElements(): ExcalidrawElement[];
+	getViewSelectedElements(includeFrameChildren?: boolean): ExcalidrawElement[];
+	getElement(id: string): ExcalidrawElement | undefined;
+	copyViewElementsToEAforEditing(elements: ExcalidrawElement[], copyImages?: boolean): void;
+	refreshTextElementSize(id: string): void;
+	addElementsToView(
+		repositionToCursor?: boolean,
+		save?: boolean,
+		newElementsOnTop?: boolean,
+		shouldRestoreElements?: boolean,
+		captureUpdate?: "IMMEDIATELY" | "NEVER" | "EVENTUALLY",
+	): Promise<boolean>;
+	destroy?(): void;
+	reset?(): void;
+	setView?(view: ItemView): void;
 }
 
-type ExcalidrawAPI = {
-	getViewElements: () => ExcalidrawElement[];
-	setViewElements?: (elements: ExcalidrawElement[]) => void;
-	save?: () => void;
-};
+export interface ExcalidrawScanResult {
+	ea: ExcalidrawApi;
+	candidates: MatchCandidate[];
+	/** 本次参与扫描的文本元素数量。 */
+	elementCount: number;
+	/** 是否只扫描了选中元素。 */
+	selectedOnly: boolean;
+}
 
-/** 获取当前激活的 Excalidraw 视图（若无返回 null）。 */
+const EXCALIDRAW_VIEW_TYPES = ["excalidraw", "excalidraw-sidepanel"];
+
+/** 判断是否 Excalidraw 视图（主画板或侧边栏画板）。 */
+export function isExcalidrawView(view: unknown): view is ItemView {
+	const t = (view as ItemView | null)?.getViewType?.();
+	return typeof t === "string" && EXCALIDRAW_VIEW_TYPES.includes(t);
+}
+
+/** 取当前激活的 Excalidraw 视图：优先活动叶子，其次按当前文件匹配，最后取唯一画板。 */
 export function getActiveExcalidrawView(app: App): ItemView | null {
-	const view = app.workspace.getActiveViewOfType(ItemView as unknown as new () => ItemView);
-	if (view && typeof view.getViewType === "function" && view.getViewType() === "excalidraw") return view;
+	const active = app.workspace.activeLeaf?.view ?? null;
+	if (isExcalidrawView(active)) return active;
+
+	const leaves = app.workspace.getLeavesOfType("excalidraw");
+	if (leaves.length === 0) return null;
+	const file = app.workspace.getActiveFile();
+	if (file) {
+		for (const l of leaves) {
+			const v = l.view as ItemView & { file?: { path: string } | null };
+			if (v?.file?.path === file.path) return v;
+		}
+	}
+	return leaves.length === 1 ? (leaves[0].view as ItemView) : null;
+}
+
+/** 拿到绑定在该视图上的 ExcalidrawAutomate。官方入口是 window.ExcalidrawAutomate.getAPI(view)。 */
+export function getExcalidrawAutomate(app: App, view: ItemView): ExcalidrawApi | null {
+	const g = (window as unknown as { ExcalidrawAutomate?: { getAPI?: (v: ItemView) => ExcalidrawApi } })
+		.ExcalidrawAutomate;
+	if (g && typeof g.getAPI === "function") {
+		try {
+			const ea = g.getAPI(view);
+			if (ea && typeof ea.getViewElements === "function") return ea;
+		} catch {
+			/* 落到退路 */
+		}
+	}
+	// 退路：直接取 Excalidraw 插件实例上的 ea 单例，并把它指向当前视图
+	const plugins = (app as unknown as { plugins?: { plugins?: Record<string, { ea?: ExcalidrawApi }> } }).plugins
+		?.plugins;
+	if (plugins) {
+		for (const [id, p] of Object.entries(plugins)) {
+			if (!id.startsWith("obsidian-excalidraw-plugin") || !p?.ea) continue;
+			try {
+				p.ea.reset?.();
+				p.ea.setView?.(view);
+				return p.ea;
+			} catch {
+				/* 继续找下一个 */
+			}
+		}
+	}
 	return null;
 }
 
-/** 扫描当前 Excalidraw 画板的所有文本元素，返回可链接候选。 */
-export function scanExcalidraw(app: App, settings: SmartLinkerSettings): ExcalidrawScanResult | null {
+/** 元素参与匹配的原文：rawText 优先（与 Excalidraw 插件自身一致），退化到 text。 */
+export function elementRawText(el: ExcalidrawElement): string {
+	const raw = el.rawText;
+	return typeof raw === "string" && raw !== "" ? raw : el.text ?? "";
+}
+
+function isTextElement(el: ExcalidrawElement | null | undefined): boolean {
+	return !!el && el.type === "text" && !el.isDeleted;
+}
+
+/**
+ * 扫描 Excalidraw 画板文本元素。
+ * 有选中元素时只扫选中的（与 Markdown 模式「选中优先」一致），否则扫整块画板。
+ */
+export function scanExcalidraw(
+	app: App,
+	settings: SmartLinkerSettings,
+	opts?: { selectedOnly?: boolean },
+): ExcalidrawScanResult | null {
 	const view = getActiveExcalidrawView(app);
 	if (!view) return null;
-	const ea = (view as unknown as { excalidrawAPI?: ExcalidrawAPI }).excalidrawAPI;
-	if (!ea || typeof ea.getViewElements !== "function") return null;
+	const ea = getExcalidrawAutomate(app, view);
+	if (!ea) return null;
 
 	const file = (view as unknown as { file?: { path: string } | null }).file ?? null;
-	const fakeFile = file ? ({ path: file.path } as never) : null;
-	const index = buildIndex(app, settings, fakeFile);
+	const index = buildIndex(app, settings, file ? ({ path: file.path } as never) : null);
 
 	let elements: ExcalidrawElement[] = [];
+	let selectedOnly = false;
 	try {
-		elements = ea.getViewElements() || [];
+		if (opts?.selectedOnly !== false) {
+			const sel = (ea.getViewSelectedElements?.() ?? []).filter(isTextElement);
+			if (sel.length > 0) {
+				elements = sel;
+				selectedOnly = true;
+			}
+		}
+		if (elements.length === 0) elements = (ea.getViewElements() ?? []).filter(isTextElement);
 	} catch {
 		return null;
 	}
 
 	const candidates: MatchCandidate[] = [];
 	for (const el of elements) {
-		if (!el || el.type !== "text") continue;
-		const text = el.text ?? el.rawText;
-		if (typeof text !== "string" || text.length === 0) continue;
+		const text = elementRawText(el);
+		if (text.trim() === "") continue;
 		const found = scanText(text, index, settings, {
 			protect: settings.protectSpecialRanges,
 			source: { element: el, text } satisfies ExcalidrawSource,
 		});
 		for (const c of found) candidates.push(c);
 	}
-	return { ea, candidates };
+	return { ea, candidates, elementCount: elements.length, selectedOnly };
 }
 
-/** 把选中的候选写回 Excalidraw 文本元素（替换为 [[双链]]），并刷新画板。返回受影响元素数。 */
-export function applyExcalidraw(ea: unknown, selections: CandidateSelection[]): number {
-	const api = ea as ExcalidrawAPI;
-	const byId = new Map<string, { element: ExcalidrawElement; text: string; reps: Replacement[] }>();
+/**
+ * 把选中的候选写回 Excalidraw 文本元素并保存。
+ *
+ * **只写 `rawText`（外加兼容用的 `originalText`）**，不写 `text`、也不调 `refreshTextElementSize`。
+ * 依据（obsidian-excalidraw-plugin 2.22.0-2 源码）：
+ * ```
+ * addElements({...}) →
+ *   const {parseResult, link} = await excalidrawData.addTextElement(t.id, t.text, t.rawText);
+ *   //                                              addTextElement(id, text, rawText) 内部只 parse(rawText)
+ *   if (textMode === TextMode.parsed && !t.isDeleted) {
+ *     const {text,x,y,width,height} = refreshTextDimensions(t, null, map, parseResult);
+ *     t.text = text; t.originalText = parseResult; t.x=x; t.y=y; t.width=width; t.height=height;
+ *   }
+ * ```
+ * 即：`rawText` 是唯一解析源，而 `text` / `originalText` / 位置 / 尺寸都由 Excalidraw 自己按解析结果回写。
+ * 我们若也去改这些字段，等于跟它的原生逻辑打架，且可能留下与重载后不一致的中间值。
+ *
+ * 画布最终显示成什么样，取决于 Excalidraw 自身的两个设置（可用 frontmatter 按画板覆盖）：
+ * `excalidraw-link-brackets`（是否显示 `[[]]`）与 `excalidraw-link-prefix`（链接前缀，如 📍）。
+ * 两者都为「否 / 空」时，`[[笔记名|原文]]` 的展示文字恰好等于原文 → 真正的排版零变化。
+ */
+export async function applyExcalidraw(
+	ea: ExcalidrawApi,
+	selections: CandidateSelection[],
+	opts: { forceAlias?: boolean } = {},
+): Promise<number> {
+	const forceAlias = opts.forceAlias !== false;
+
+	const byId = new Map<string, { element: ExcalidrawElement; src: string; reps: Replacement[] }>();
 	for (const { candidate, targetIndex } of selections) {
 		const src = candidate.source as ExcalidrawSource | undefined;
 		const el = src?.element;
-		if (!el || !el.id) continue;
+		if (!src || !el?.id) continue;
 		let entry = byId.get(el.id);
 		if (!entry) {
-			entry = { element: el, text: src.text, reps: [] };
+			entry = { element: el, src: src.text, reps: [] };
 			byId.set(el.id, entry);
 		}
-		entry.reps.push(...buildReplacements(src.text, candidate, targetIndex));
+		entry.reps.push(...buildReplacements(src.text, candidate, targetIndex, { forceAlias, escapeTable: false }));
 	}
-	if (byId.size === 0) return 0;
 
-	const newTextById = new Map<string, string>();
+	const plan: Array<{ id: string; raw: string }> = [];
 	for (const [id, entry] of byId) {
-		newTextById.set(id, applyToString(entry.text, entry.reps));
+		if (entry.reps.length === 0) continue;
+		const raw = applyToString(entry.src, entry.reps);
+		if (raw === entry.src) continue;
+		plan.push({ id, raw });
+	}
+	if (plan.length === 0) return 0;
+
+	try {
+		ea.copyViewElementsToEAforEditing(plan.map((p) => byId.get(p.id)!.element));
+	} catch {
+		return 0;
 	}
 
-	let all: ExcalidrawElement[] = [];
-	try {
-		all = api.getViewElements() || [];
-	} catch {
-		/* ignore */
+	for (const p of plan) {
+		const el = ea.getElement?.(p.id) ?? byId.get(p.id)!.element;
+		if (!el) continue;
+		// 只动这两个字段，其余交给 Excalidraw 派生
+		el.rawText = p.raw;
+		el.originalText = p.raw;
 	}
-	if (Array.isArray(all) && typeof api.setViewElements === "function") {
-		const newAll = all.map((el) =>
-			newTextById.has(el.id) ? ({ ...el, text: newTextById.get(el.id) }) : el,
-		);
-		api.setViewElements(newAll);
-	} else {
-		// 退路：直接改原对象
-		for (const [id, entry] of byId) {
-			(entry.element as ExcalidrawElement).text = newTextById.get(id);
+
+	try {
+		// save=true 落盘；captureUpdate=IMMEDIATELY 让这次改动可 Ctrl+Z 撤销
+		await ea.addElementsToView(false, true, false, true, "IMMEDIATELY");
+	} catch {
+		return 0;
+	} finally {
+		try {
+			ea.destroy?.();
+		} catch {
+			/* 忽略 */
 		}
 	}
-	try {
-		if (typeof api.save === "function") api.save();
-	} catch {
-		/* ignore */
+	return plan.length;
+}
+
+// ─────────────────── 链接装饰（📍 前缀 / [[ ]] 方括号）───────────────────
+
+/** Excalidraw 的链接装饰设置在某块画板上的生效值。 */
+export interface LinkDecoration {
+	/** 是否在链接两侧显示 [[ ]] 方括号。 */
+	brackets: boolean;
+	/** 链接前缀（如「📍」），空串表示不加前缀。 */
+	prefix: string;
+	/** 取值来源：frontmatter 覆盖优先，其次 Excalidraw 插件全局设置。 */
+	source: "frontmatter" | "plugin" | "unknown";
+}
+
+/** Excalidraw 的按画板覆盖用 frontmatter 键（见其 FRONTMATTER_KEYS）。 */
+export const FM_LINK_BRACKETS = "excalidraw-link-brackets";
+export const FM_LINK_PREFIX = "excalidraw-link-prefix";
+
+/** 找到 Excalidraw 插件实例（官方版或 ymjr 分支）及其设置。 */
+export function findExcalidrawPlugin(app: App): { id: string; settings: Record<string, unknown> | null } | null {
+	const plugins = (app as unknown as { plugins?: { plugins?: Record<string, { settings?: Record<string, unknown> }> } })
+		.plugins?.plugins;
+	if (!plugins) return null;
+	for (const [id, p] of Object.entries(plugins)) {
+		if (id.startsWith("obsidian-excalidraw-plugin")) return { id, settings: p?.settings ?? null };
 	}
-	return byId.size;
+	return null;
+}
+
+/**
+ * 读取链接装饰在该画板上的生效值。
+ * 与 Excalidraw 的 `setShowLinkBrackets()` / `setLinkPrefix()` 一致：frontmatter 覆盖优先于全局设置。
+ */
+export function getLinkDecoration(app: App, file: TFile | null): LinkDecoration {
+	const fm = (file ? app.metadataCache.getFileCache(file)?.frontmatter : null) ?? null;
+	const settings = findExcalidrawPlugin(app)?.settings ?? null;
+	const hasFmBrackets = fm !== null && fm[FM_LINK_BRACKETS] !== undefined && fm[FM_LINK_BRACKETS] !== null;
+	const hasFmPrefix = fm !== null && fm[FM_LINK_PREFIX] !== undefined && fm[FM_LINK_PREFIX] !== null;
+
+	const brackets = hasFmBrackets
+		? fm![FM_LINK_BRACKETS] !== false
+		: settings?.showLinkBrackets === true;
+	const rawPrefix = hasFmPrefix ? fm![FM_LINK_PREFIX] : settings?.linkPrefix;
+	const prefix = typeof rawPrefix === "string" ? rawPrefix : "";
+
+	if (!settings && !hasFmBrackets && !hasFmPrefix) {
+		return { brackets: false, prefix: "", source: "unknown" };
+	}
+	return { brackets, prefix, source: hasFmBrackets || hasFmPrefix ? "frontmatter" : "plugin" };
+}
+
+/**
+ * 为该画板写入 frontmatter，关掉 Excalidraw 的链接装饰（📍 前缀与 [[ ]] 方括号），
+ * 使画布文字在「加链接前 / 加链接后」完全一致（含尺寸）——即真正的排版零变化。
+ *
+ * 返回是否真的改动了文件：true 表示 frontmatter 变了，需要重开该画板才会生效。
+ */
+export async function ensureZeroLayoutFrontmatter(app: App, file: TFile): Promise<boolean> {
+	let changed = false;
+	await app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+		if (fm[FM_LINK_BRACKETS] !== false) {
+			fm[FM_LINK_BRACKETS] = false;
+			changed = true;
+		}
+		if (fm[FM_LINK_PREFIX] !== "") {
+			fm[FM_LINK_PREFIX] = "";
+			changed = true;
+		}
+	});
+	return changed;
+}
+
+/** 是否正在 Excalidraw 里编辑某个文本元素（此时应推迟写回，避免和文本编辑器打架）。 */
+export function isEditingTextInView(view: ItemView): boolean {
+	const el = document.activeElement as HTMLElement | null;
+	if (!el || !view.containerEl.contains(el)) return false;
+	return el.tagName === "TEXTAREA" || el.tagName === "INPUT" || el.isContentEditable;
 }

@@ -21,6 +21,21 @@ export function normalizeNewlines(text: string): string {
 	return text.replace(/\r\n?/g, "\n");
 }
 
+/** 取第一段非空行的前若干字符，作为「这段内容来自本次粘贴」的指纹。 */
+export function firstMeaningfulLine(text: string, maxLen = 24): string {
+	for (const line of normalizeNewlines(text).split("\n")) {
+		const t = line.trim();
+		if (t !== "") return t.slice(0, maxLen);
+	}
+	return "";
+}
+
+/** 文本是否包含粘贴指纹（用于识别 Excalidraw 里由本次粘贴产生的文本元素）。 */
+export function snippetMatches(text: string, snippet: string): boolean {
+	if (snippet === "") return false;
+	return normalizeNewlines(text).includes(snippet);
+}
+
 /** 求两串的最长公共前缀长度。 */
 export function commonPrefixLen(a: string, b: string): number {
 	const n = Math.min(a.length, b.length);

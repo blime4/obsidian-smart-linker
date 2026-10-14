@@ -1,10 +1,27 @@
-import { Editor, MarkdownView, Notice, Plugin, type MarkdownFileInfo, type TFile } from "obsidian";
-import { DEFAULT_SETTINGS, type MatchCandidate, type SmartLinkerSettings } from "./types";
+import { Editor, ItemView, MarkdownView, Notice, Plugin, type MarkdownFileInfo, type TFile } from "obsidian";
+import {
+	DEFAULT_SETTINGS,
+	type CandidateSelection,
+	type MatchCandidate,
+	type SmartLinkerSettings,
+} from "./types";
 import { applyReplacements, buildIndex, buildReplacements, scan, scanText } from "./linker";
-import { applyExcalidraw, getActiveExcalidrawView, scanExcalidraw } from "./excalidraw";
+import {
+	applyExcalidraw,
+	elementRawText,
+	ensureZeroLayoutFrontmatter,
+	getActiveExcalidrawView,
+	getExcalidrawAutomate,
+	getLinkDecoration,
+	isEditingTextInView,
+	scanExcalidraw,
+	type ExcalidrawApi,
+	type ExcalidrawElement,
+	type ExcalidrawSource,
+} from "./excalidraw";
 import { LinkSuggestModal } from "./modal";
 import { SmartLinkerSettingTab } from "./settings";
-import { countLines, locateInsertedRange, type Range } from "./utils";
+import { countLines, firstMeaningfulLine, locateInsertedRange, snippetMatches, type Range } from "./utils";
 
 export default class SmartLinkerPlugin extends Plugin {
 	settings: SmartLinkerSettings = DEFAULT_SETTINGS;
@@ -59,6 +76,14 @@ export default class SmartLinkerPlugin extends Plugin {
 			}),
 		);
 
+		// Excalidraw 画板没有 editor-paste 事件，改在 DOM 层捕获粘贴后轮询场景变化。
+		this.registerDomEvent(
+			this.app.workspace.containerEl,
+			"paste",
+			(evt: ClipboardEvent) => this.onExcalidrawPaste(evt),
+			{ capture: true },
+		);
+
 		this.addSettingTab(new SmartLinkerSettingTab(this.app, this));
 	}
 
@@ -102,31 +127,74 @@ export default class SmartLinkerPlugin extends Plugin {
 		}).open();
 	}
 
+	/** Excalidraw 画板：候选预览与写回都走 ExcalidrawAutomate。 */
 	private runExcalidraw(): void {
 		const res = scanExcalidraw(this.app, this.settings);
 		if (!res) {
-			new Notice("未找到 Excalidraw 脚本 API（请确认 Excalidraw 插件已启用并打开了画板）");
+			new Notice("未找到 Excalidraw 画板（请确认 Excalidraw 插件已启用并打开了画板）");
 			return;
 		}
 		if (res.candidates.length === 0) {
-			new Notice("未发现可链接的文本元素");
+			new Notice(
+				res.selectedOnly
+					? "选中的元素里没有可链接的词"
+					: `未发现可链接的词（已扫描 ${res.elementCount} 个文本元素）`,
+			);
 			return;
 		}
+		const forceAlias = this.settings.eaAliasAlways;
 		new LinkSuggestModal(this.app, res.candidates, {
-			subtitle: `发现 ${res.candidates.length} 个可链接项（Excalidraw）。会把所选文字替换为 [[双链]]。`,
+			subtitle: `发现 ${res.candidates.length} 个可链接词（Excalidraw${
+				res.selectedOnly ? " · 仅选中元素" : ` · ${res.elementCount} 个文本元素`
+			}）。写入 ${forceAlias ? "[[笔记名|原文]]" : "[[双链]]"}，画布文字内容不变。`,
 			previewLink: (c, i) => {
 				const src = c.source as { text?: string } | undefined;
-				return buildReplacements(src?.text ?? c.text, c, i)[0]?.text ?? "";
+				return buildReplacements(src?.text ?? c.text, c, i, { forceAlias, escapeTable: false })[0]?.text ?? "";
 			},
 			onApply: (sels) => {
-				try {
-					const n = applyExcalidraw(res.ea, sels);
-					new Notice(n > 0 ? `已链接 ${n} 个 Excalidraw 文本元素` : "未选择任何项");
-				} catch (e) {
-					new Notice(`应用失败：${String(e)}`);
-				}
+				void this.applyExcalidrawSelections(res.ea, sels);
 			},
 		}).open();
+	}
+
+	/** Excalidraw 写回 + 提示（手动与自动共用）。 */
+	private async applyExcalidrawSelections(ea: ExcalidrawApi, sels: CandidateSelection[]): Promise<void> {
+		try {
+			const n = await applyExcalidraw(ea, sels, { forceAlias: this.settings.eaAliasAlways });
+			const hint = n > 0 ? await this.linkDecorationHint(ea) : "";
+			if (!this.settings.autoLinkShowNotice) return;
+			new Notice(n > 0 ? `已给 ${n} 个 Excalidraw 文本元素建链（Ctrl+Z 可撤销）${hint}` : "没有可写入的改动");
+		} catch (e) {
+			new Notice(`Excalidraw 写入失败：${String(e)}`);
+		}
+	}
+
+	/** 当前画板对应的文件（用于读写 frontmatter、判断装饰设置）。 */
+	private excalidrawFile(ea: ExcalidrawApi): TFile | null {
+		const v = ea.targetView as (ItemView & { file?: TFile | null }) | undefined;
+		return v?.file ?? null;
+	}
+
+	/**
+	 * 链接装饰（📍 前缀 / [[ ]] 方括号）的处理与提示。
+	 * - 开启「排版零变化」：给画板写 frontmatter 关掉装饰，返回「需重开画板」的提示
+	 * - 未开启：若装饰开着，提示画布上会多出这些符号、以及怎么做到完全不变
+	 */
+	private async linkDecorationHint(ea: ExcalidrawApi): Promise<string> {
+		try {
+			const file = this.excalidrawFile(ea);
+			if (this.settings.eaZeroLayout) {
+				if (!file) return "";
+				const changed = await ensureZeroLayoutFrontmatter(this.app, file);
+				return changed ? "（已为该画板关闭链接装饰，重开画板后生效）" : "";
+			}
+			const dec = getLinkDecoration(this.app, file);
+			if (!dec.brackets && dec.prefix === "") return "";
+			const marks = `${dec.prefix}${dec.brackets ? "[[]]" : ""}`;
+			return `（画布上链接会显示成「${marks}…」，要排版完全不变可开启「排版零变化」）`;
+		} catch {
+			return "";
+		}
 	}
 
 	// ───────────────────────── 粘贴后自动双链 ─────────────────────────
@@ -251,6 +319,137 @@ export default class SmartLinkerPlugin extends Plugin {
 
 	async loadSettings(): Promise<void> {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	}
+
+	// ───────────────── Excalidraw 画板：粘贴自动双链 ─────────────────
+
+	/**
+	 * 画板粘贴入口。Excalidraw 没有「粘贴完成」事件，且粘贴在画布上（新建文本元素）
+	 * 与在文本框内编辑（提交后才落到元素上）时序不同，因此统一用轮询比对场景变化：
+	 * 找到「新增的 / 内容变化且包含粘贴片段」的文本元素，等编辑结束后自动建链，只处理一次。
+	 */
+	private onExcalidrawPaste(evt: ClipboardEvent): void {
+		const s = this.settings;
+		if (!s.autoLinkOnPaste || !s.autoLinkExcalidrawOnPaste) return;
+
+		const target = evt.target as Node | null;
+		const view = getActiveExcalidrawView(this.app);
+		if (!view || !target || !view.containerEl.contains(target)) return;
+
+		const raw = evt.clipboardData?.getData("text/plain") ?? "";
+		if (raw.trim() === "" || countLines(raw) <= s.autoLinkMinLines) return;
+
+		const ea = getExcalidrawAutomate(this.app, view);
+		if (!ea) return;
+
+		const before = this.snapshotTextElements(ea);
+		const snippet = firstMeaningfulLine(raw);
+		if (snippet === "") return;
+
+		let tries = 0;
+		const timer = window.setInterval(() => {
+			tries++;
+			if (tries > 40 || !view.containerEl.isConnected) {
+				window.clearInterval(timer);
+				return;
+			}
+			// 还在文本框里编辑 → 等提交后再处理，避免和 Excalidraw 的文本编辑器打架
+			if (isEditingTextInView(view)) return;
+
+			const changed = this.findPastedElements(ea, before, snippet, s.autoLinkMinLines);
+			if (changed.length === 0) return;
+			window.clearInterval(timer);
+			void this.autoLinkExcalidrawElements(ea, changed);
+		}, 400);
+	}
+
+	/** 记录当前画板所有文本元素的原文（id → 原文），用于识别粘贴后变化了哪些元素。 */
+	private snapshotTextElements(ea: ExcalidrawApi): Map<string, string> {
+		const map = new Map<string, string>();
+		try {
+			for (const el of ea.getViewElements() ?? []) {
+				if (el?.type === "text" && !el.isDeleted) map.set(el.id, elementRawText(el));
+			}
+		} catch {
+			/* 忽略：拿不到场景时按空快照处理 */
+		}
+		return map;
+	}
+
+	/** 找出因本次粘贴而出现/改变的文本元素：新增、或原文变化且包含粘贴片段、且行数达标。 */
+	private findPastedElements(
+		ea: ExcalidrawApi,
+		before: Map<string, string>,
+		snippet: string,
+		minLines: number,
+	): ExcalidrawElement[] {
+		let elements: ExcalidrawElement[] = [];
+		try {
+			elements = ea.getViewElements() ?? [];
+		} catch {
+			return [];
+		}
+		const out: ExcalidrawElement[] = [];
+		for (const el of elements) {
+			if (el?.type !== "text" || el.isDeleted || !el.id) continue;
+			const text = elementRawText(el);
+			if (text === "" || countLines(text) <= minLines) continue;
+			const old = before.get(el.id);
+			if (old !== undefined && old === text) continue; // 没变化
+			if (!snippetMatches(text, snippet)) continue;
+			out.push(el);
+		}
+		return out;
+	}
+
+	/** 对粘贴产生的 Excalidraw 文本元素自动建链（默认目标、可选跳过歧义词）。 */
+	private async autoLinkExcalidrawElements(ea: ExcalidrawApi, elements: ExcalidrawElement[]): Promise<void> {
+		const s = this.settings;
+		const file = (ea.targetView as (ItemView & { file?: TFile | null }) | undefined)?.file ?? null;
+		const index = buildIndex(this.app, s, file ? ({ path: file.path } as never) : null);
+
+		let candidates: MatchCandidate[] = [];
+		for (const el of elements) {
+			const text = elementRawText(el);
+			const found = scanText(text, index, s, {
+				protect: s.protectSpecialRanges,
+				source: { element: el, text } satisfies ExcalidrawSource,
+			});
+			candidates.push(...found);
+		}
+		if (s.autoLinkSkipAmbiguous) candidates = candidates.filter((c) => c.targets.length === 1);
+		if (candidates.length === 0) {
+			if (s.autoLinkShowNotice) {
+				new Notice(`画板粘贴内容超过 ${s.autoLinkMinLines} 行，但未发现可链接的词`);
+			}
+			return;
+		}
+
+		if (s.autoLinkMode === "confirm") {
+			const forceAlias = s.eaAliasAlways;
+			new LinkSuggestModal(this.app, candidates, {
+				subtitle: `画板粘贴自动双链 · ${candidates.length} 个词待确认`,
+				previewLink: (c, i) => {
+					const src = c.source as { text?: string } | undefined;
+					return buildReplacements(src?.text ?? c.text, c, i, { forceAlias, escapeTable: false })[0]?.text ?? "";
+				},
+				onApply: (sels) => {
+					void this.applyExcalidrawSelections(ea, sels);
+				},
+			}).open();
+			return;
+		}
+
+		const sels: CandidateSelection[] = candidates.map((c) => ({
+			candidate: c,
+			targetIndex: c.defaultTargetIndex,
+		}));
+		const n = await applyExcalidraw(ea, sels, { forceAlias: s.eaAliasAlways });
+		if (n <= 0) return;
+		const hint = await this.linkDecorationHint(ea);
+		if (s.autoLinkShowNotice) {
+			new Notice(`画板粘贴自动双链：${n} 个文本元素（Ctrl+Z 可撤销）${hint}`);
+		}
 	}
 
 	async saveSettings(): Promise<void> {

@@ -1,13 +1,13 @@
 {
 	"name": "smart-linker",
-	"version": "0.2.0",
-	"description": "智能双链助手：把当前笔记中与已有笔记名/别名匹配的词转为 [[]] 双链；粘贴内容行数超阈值时自动建链。",
+	"version": "0.4.0",
+	"description": "智能双链助手：把当前笔记中与已有笔记名/别名匹配的词转为 [[]] 双链；粘贴内容行数超阈值时自动建链（Markdown 与 Excalidraw 画板都支持）。",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-		"test": "esbuild test-locate.ts --bundle --platform=node --format=cjs --outfile=.test/test-locate.cjs && node .test/test-locate.cjs && esbuild test-scan.ts --bundle --platform=node --format=cjs --outfile=.test/test-scan.cjs && node .test/test-scan.cjs"
+		"test": "esbuild test-locate.ts --bundle --platform=node --format=cjs --alias:obsidian=./obsidian-stub.ts --outfile=.test/test-locate.cjs && node .test/test-locate.cjs && esbuild test-scan.ts --bundle --platform=node --format=cjs --alias:obsidian=./obsidian-stub.ts --outfile=.test/test-scan.cjs && node .test/test-scan.cjs && esbuild test-excalidraw.ts --bundle --platform=node --format=esm --alias:obsidian=./obsidian-stub.ts --outfile=.test/test-excalidraw.mjs && node .test/test-excalidraw.mjs"
 	},
 	"keywords": [
 		"obsidian",

@@ -34,6 +34,17 @@ export interface SmartLinkerSettings {
 	autoLinkSkipAmbiguous: boolean;
 	/** 自动双链后是否弹出结果提示。 */
 	autoLinkShowNotice: boolean;
+	/** Excalidraw 画板上粘贴多行文本后是否也自动双链。 */
+	autoLinkExcalidrawOnPaste: boolean;
+	/** Excalidraw 写入时总是用 [[笔记名|原文]]：双链的显示文字取「原文」，画布文字不会变成笔记名。 */
+	eaAliasAlways: boolean;
+	/**
+	 * 排版零变化：写链时自动给该画板写入 frontmatter，关闭 Excalidraw 的链接装饰
+	 * （`excalidraw-link-brackets: false` + `excalidraw-link-prefix: ""`）。
+	 * 开启后画布上文字与文本框尺寸在加链接前后完全一致；代价是会同时去掉该画板上
+	 * 所有已有链接的 📍 / [[]] 装饰，且需要重开画板才生效。
+	 */
+	eaZeroLayout: boolean;
 }
 
 /** 默认设置。 */
@@ -54,6 +65,9 @@ export const DEFAULT_SETTINGS: SmartLinkerSettings = {
 	autoLinkMode: "apply",
 	autoLinkSkipAmbiguous: false,
 	autoLinkShowNotice: true,
+	autoLinkExcalidrawOnPaste: true,
+	eaAliasAlways: true,
+	eaZeroLayout: false,
 };
 
 /** 索引中一个可链接目标：某个词指向某篇笔记。 */
