@@ -10,6 +10,7 @@
 - 中文友好（按字面匹配），拉丁字母可选整词匹配；复合词（如 `Chunked-prefill`、`auto_link`）视为整体，不会拆出子词
 - 同一词匹配多篇笔记时可在下拉框选择目标
 - **失效 `[[链接]]` 重写**：指向已删除笔记、但该词已变成某笔记别名的链接（如 `[[EAGLE]]` → `[[EAGLE-3|EAGLE]]`）也能被扫描发现并一键修复
+- **补全已有双链为最长匹配**：`[[DFlash]] 2` 会被认出是更长的词 `DFlash 2`，改写为 `[[DFlash|DFlash 2]]`——链接目标不变、渲染文字一致，只是链接变完整
 - **同时支持 Markdown 笔记和 Excalidraw 画板**；画板里只改写底层原文（`rawText`），链接在底层生效，画布文字内容不变（要连排版都零变化，见下文「关于『排版零变化』」）
 - 可按 tag 过滤（如排除带 `#private` 的笔记作为链接目标）
 
@@ -175,6 +176,28 @@ Excalidraw 暴露两套 API，容易踩坑：
 | 跳过特殊区域 | 开 | 不在代码块/公式/已有链接等区域创建链接 |
 | 行内代码内转链 | 开 | `` `EagleDraftWorker` `` 这类反引号内整段等于笔记名的词可转成 `[[EagleDraftWorker]]`（含反引号一起替换） |
 | 失效 `[[链接]]` 重写 | 开 | 指向已删除笔记、但命中某笔记别名的链接会被列出并重写，如 `[[EAGLE]]` → `[[EAGLE-3|EAGLE]]` |
+| 补全已有双链为最长匹配 | 开 | 已有链接与紧邻文字合并后重新匹配，命中更长的词就改写，如 `[[DFlash]] 2` → `[[DFlash\|DFlash 2]]`；只改目标不变的链接 |
+
+### 补全已有双链（最长匹配）说明
+
+默认开启。已有链接会和紧邻的文字合并起来重新参与「最长匹配」：插件把文档投影成**渲染后可见的文字**（`[[目标|显示]]` 只算「显示」那几个字），再在投影文本上扫描，命中更长词条时把整段重写成一条更完整的链接。
+
+- `[[DFlash]] 2` → `[[DFlash|DFlash 2]]`（`DFlash.md` 的别名里有 `DFlash 2`）
+- `[[DFlash]]2` → `[[DFlash|DFlash2]]`（无空格，命中另一个别名）
+- `[[Hidden|hidden]] states` → `[[Hidden|hidden states]]`
+- `[[ELF]] 文件` → `[[ELF|ELF 文件]]`
+
+两端**可见文字完全相同**，所以渲染出来的样子不变，只是链接从半截变成了完整词（`Ctrl+Z` 可撤销）。
+
+安全阀（任一条不满足就不改）：
+
+- 只处理**正好一条链接**的情况；区间里有两条链接（如 `[[A]] [[B]]`）不合并
+- 命中必须**完整覆盖**该链接的显示文字；只盖住半截（如 `[[X|the ABC thing]]` 里的 `ABC`）不动
+- 默认**只改目标不变的链接**；更长的词若指向另一篇笔记，直接跳过（弹窗里这类候选会标「补全」）
+- 带 `#标题` / `^块` 后缀的链接、`![[嵌入]]`、代码块与行内代码、数学公式内都不动
+- 没有变得「更长」就不产生改动（孤立一个 `[[DFlash]]` 不会被改成 `[[DFlash|DFlash]]`），因此可反复运行、幂等
+
+不处理：跨行（`[[DFlash]]` 换行后的 `2`）、被 Markdown 标记打断（`[[DFlash]] **2**`）、以及拼写错误（`[[DFlas]] 2`）。
 
 ### 失效 `[[链接]]` 重写说明
 
@@ -210,15 +233,16 @@ aliases: [小猫, 喵星人]
 
 ## 开发自测
 
-`utils.ts` 的粘贴区间定位、`linker.ts` 的窗口扫描，以及 `excalidraw.ts` 的写回契约与链接装饰读取（`applyExcalidraw` / `getLinkDecoration` / `ensureZeroLayoutFrontmatter`，用 mock 的 ExcalidrawAutomate 与 mock 的 App）都是纯逻辑，不依赖 Obsidian 运行时，可直接在本地跑断言（共 66 条）：
+`utils.ts` 的粘贴区间定位与可见文本投影、`linker.ts` 的窗口扫描与双链补全，以及 `excalidraw.ts` 的写回契约与链接装饰读取（`applyExcalidraw` / `getLinkDecoration` / `ensureZeroLayoutFrontmatter`，用 mock 的 ExcalidrawAutomate 与 mock 的 App）都是纯逻辑，不依赖 Obsidian 运行时，可直接在本地跑断言（共 122 条）：
 
 ```bash
 npx esbuild test-locate.ts     --bundle --platform=node --format=cjs --outfile=.test/test-locate.cjs && node .test/test-locate.cjs
 npx esbuild test-scan.ts       --bundle --platform=node --format=cjs --outfile=.test/test-scan.cjs   && node .test/test-scan.cjs
+npx esbuild test-extend.ts     --bundle --platform=node --format=cjs --outfile=.test/test-extend.cjs --alias:obsidian=./obsidian-stub.ts && node .test/test-extend.cjs
 npx esbuild test-excalidraw.ts --bundle --platform=node --format=esm --alias:obsidian=./obsidian-stub.ts --outfile=.test/test-excalidraw.mjs && node .test/test-excalidraw.mjs
 ```
 
-（`obsidian-stub.ts` 是给 node 用的 obsidian 运行时替身，仅自测时通过 `--alias` 注入；`npm test` 会依次跑全部三个文件。）
+（`obsidian-stub.ts` 是给 node 用的 obsidian 运行时替身，仅自测时通过 `--alias` 注入；`npm test` 会依次跑全部文件。）
 
 ## 目录结构
 

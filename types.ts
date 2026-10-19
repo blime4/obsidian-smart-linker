@@ -20,6 +20,12 @@ export interface SmartLinkerSettings {
 	linkInlineCode: boolean;
 	/** 是否把指向不存在笔记、但命中某笔记别名的失效 [[链接]] 重写为该笔记。 */
 	fixBrokenLinks: boolean;
+	/**
+	 * 是否把「已有双链 + 紧邻文字」重新按最长匹配补全。
+	 * 例：`[[DFlash]] 2` 中 DFlash.md 有别名 `DFlash 2` → 改写为 `[[DFlash|DFlash 2]]`。
+	 * 只改目标不变的链接；可见文字两端一致，渲染零变化。
+	 */
+	linkExtendToLongest: boolean;
 	/** 排除的 tag（含此 tag 的笔记不作为链接目标，支持层级前缀，如 private 会排除 private/xxx）。 */
 	excludedTags: string[];
 	/** 粘贴后是否自动扫描并建链（无需按快捷键）。 */
@@ -64,6 +70,7 @@ export const DEFAULT_SETTINGS: SmartLinkerSettings = {
 	protectSpecialRanges: true,
 	linkInlineCode: true,
 	fixBrokenLinks: true,
+	linkExtendToLongest: true,
 	excludedTags: [],
 	autoLinkOnPaste: true,
 	autoLinkMinLines: 5,
@@ -99,6 +106,11 @@ export interface WikilinkInfo {
 	display?: string;
 	/** 标题/块引用后缀（如 #章节、^block），无则空串。 */
 	suffix: string;
+	/**
+	 * 是否为「补全已有双链」产生的重写。
+	 * 为 true 时 from/to 覆盖「原链接 + 紧邻文字」，display 是命中的完整可见文字。
+	 */
+	extended?: boolean;
 }
 
 /** 文档中一处命中的位置区间 [from, to)。 */

@@ -301,6 +301,157 @@ export function computeProtectedRanges(
 	return mergeRanges(ranges);
 }
 
+/**
+ * 不可跨越的哨兵字符。嵌入 ![[...]] 之类在可见文本里没有对应文字，
+ * 用它在投影里占一个位置，任何真实词条都不可能包含它，因此匹配不会跨过去。
+ */
+const BARRIER = "\u0000";
+
+/** 投影里的一条 wikilink（只记录定位所需信息）。 */
+export interface ProjectionLink {
+	/** 链接目标（不含 # / ^ 后缀）。 */
+	target: string;
+	/** #标题 / ^块 后缀，无则空串。 */
+	suffix: string;
+	/** 可见文字（| 后别名，无别名则取目标）。 */
+	display: string;
+	/** 整个 [[...]] 在原文中的区间。 */
+	fullFrom: number;
+	fullTo: number;
+}
+
+/** 原文区间 ↔ 可见文本区间的一段映射。 */
+export interface ProjectionSegment {
+	/** 原文区间。 */
+	dFrom: number;
+	dTo: number;
+	/** 可见文本区间。 */
+	pFrom: number;
+	pTo: number;
+	/** 本段若是一条 wikilink，记录其信息。 */
+	link?: ProjectionLink;
+}
+
+/** 文档投影：可见文本 + 逐段映射表。 */
+export interface Projection {
+	text: string;
+	segments: ProjectionSegment[];
+}
+
+/**
+ * 把文档投影成「渲染后可见的文字」。
+ * - `[[目标]]` / `[[目标|显示]]` 在投影里只占「显示文字」的长度
+ * - `![[嵌入]]` 用哨兵占位，保证匹配不跨越
+ * 这样 `[[DFlash]] 2` 会变成 `DFlash 2`，能正常参与最长匹配。
+ */
+export function buildProjection(text: string): Projection {
+	const segments: ProjectionSegment[] = [];
+	let projected = "";
+	let cursor = 0;
+
+	const pushText = (from: number, to: number): void => {
+		if (to <= from) return;
+		const chunk = text.slice(from, to);
+		segments.push({ dFrom: from, dTo: to, pFrom: projected.length, pTo: projected.length + chunk.length });
+		projected += chunk;
+	};
+
+	const pushOpaque = (from: number, to: number, link?: ProjectionLink): void => {
+		const p = projected.length;
+		segments.push({ dFrom: from, dTo: to, pFrom: p, pTo: p + BARRIER.length, link });
+		projected += BARRIER;
+	};
+
+	const wikiRe = /!?\[\[[^\]\n]*\]\]/g;
+	let m: RegExpExecArray | null;
+	while ((m = wikiRe.exec(text)) !== null) {
+		const full = m[0];
+		const dFrom = m.index;
+		const dTo = dFrom + full.length;
+		pushText(cursor, dFrom);
+		cursor = dTo;
+
+		const embed = full[0] === "!";
+		if (embed) {
+			pushOpaque(dFrom, dTo);
+			continue;
+		}
+		const inner = full.slice(2, -2);
+		let pipeIdx = -1;
+		for (let i = 0; i < inner.length; i++) {
+			if (inner[i] === "|" && (i === 0 || inner[i - 1] !== "\\")) {
+				pipeIdx = i;
+				break;
+			}
+		}
+		const targetPart = pipeIdx === -1 ? inner : inner.slice(0, pipeIdx);
+		const aliasPart = pipeIdx === -1 ? undefined : inner.slice(pipeIdx + 1);
+		const hash = targetPart.search(/[#^]/);
+		const target = hash === -1 ? targetPart : targetPart.slice(0, hash);
+		const suffix = hash === -1 ? "" : targetPart.slice(hash);
+		const display = aliasPart !== undefined ? aliasPart : target;
+		if (target === "" || display === "" || display.includes("|")) {
+			// 目标为空、显示为空、或显示文字里还有未转义管道：不参与补全，整段当哨兵
+			pushOpaque(dFrom, dTo);
+			continue;
+		}
+		segments.push({ dFrom, dTo, pFrom: projected.length, pTo: projected.length + display.length, link: { target, suffix, display, fullFrom: dFrom, fullTo: dTo } });
+		projected += display;
+	}
+	pushText(cursor, text.length);
+	return { text: projected, segments };
+}
+
+/** 在投影里定位同时包含 p 的一段（isEnd=true 时按右边界语义）。 */
+function locateSegment(segments: ProjectionSegment[], p: number, isEnd: boolean): ProjectionSegment | null {
+	for (let i = segments.length - 1; i >= 0; i--) {
+		const s = segments[i];
+		if (isEnd ? p > s.pFrom && p <= s.pTo : p >= s.pFrom && p < s.pTo) return s;
+	}
+	return null;
+}
+
+/** 投影区间映射回原文的结果。 */
+export interface ProjectedRange {
+	dFrom: number;
+	dTo: number;
+	/** 区间内被完整覆盖的 wikilink。 */
+	links: ProjectionLink[];
+}
+
+/**
+ * 把投影区间 [pFrom,pTo) 映射回原文区间。
+ * 命中若从链接显示文字中间开始、或在其中间结束，返回 null（不允许改动半截链接）。
+ */
+export function mapProjectedRange(proj: Projection, pFrom: number, pTo: number): ProjectedRange | null {
+	if (pTo <= pFrom) return null;
+	const sSeg = locateSegment(proj.segments, pFrom, false);
+	const eSeg = locateSegment(proj.segments, pTo, true);
+	if (!sSeg || !eSeg) return null;
+
+	let dFrom: number;
+	if (sSeg.link) {
+		if (pFrom !== sSeg.pFrom) return null;
+		dFrom = sSeg.dFrom;
+	} else {
+		dFrom = sSeg.dFrom + (pFrom - sSeg.pFrom);
+	}
+
+	let dTo: number;
+	if (eSeg.link) {
+		if (pTo !== eSeg.pTo) return null;
+		dTo = eSeg.dTo;
+	} else {
+		dTo = eSeg.dFrom + (pTo - eSeg.pFrom);
+	}
+
+	const links: ProjectionLink[] = [];
+	for (const s of proj.segments) {
+		if (s.link && pFrom <= s.pFrom && s.pTo <= pTo) links.push(s.link);
+	}
+	return { dFrom, dTo, links };
+}
+
 /** 判断 [from,to) 是否落在任意受保护区间内（ranges 须已合并、升序、不相交）。 */
 export function isProtected(ranges: Range[], from: number, to: number): boolean {
 	let lo = 0;

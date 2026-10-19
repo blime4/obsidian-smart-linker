@@ -160,6 +160,15 @@ export default class SmartLinkerPlugin extends Plugin {
 		}).open();
 	}
 
+	/** 统计「补全已有双链」的处数，用于把新建与补全分开提示。 */
+	private countExtended(candidates: MatchCandidate[]): number {
+		let n = 0;
+		for (const c of candidates) {
+			for (const o of c.occurrences) if (o.link?.extended) n++;
+		}
+		return n;
+	}
+
 	/** Excalidraw 写回 + 提示（手动与自动共用）。 */
 	private async applyExcalidrawSelections(ea: ExcalidrawApi, sels: CandidateSelection[]): Promise<void> {
 		try {
@@ -316,7 +325,9 @@ export default class SmartLinkerPlugin extends Plugin {
 		if (reps.length === 0) return;
 		applyReplacements(editor, reps);
 		if (s.autoLinkShowNotice) {
-			new Notice(`粘贴自动双链：${reps.length} 处 · ${candidates.length} 个词（Ctrl+Z 可撤销）`);
+			const ext = this.countExtended(candidates);
+			const detail = ext > 0 ? `新建 ${reps.length - ext} 处 · 补全 ${ext} 处` : `${reps.length} 处`;
+			new Notice(`粘贴自动双链：${detail}（Ctrl+Z 可撤销）`);
 		}
 	}
 
@@ -497,7 +508,9 @@ export default class SmartLinkerPlugin extends Plugin {
 		if (n <= 0) return;
 		const hint = await this.linkDecorationHint(ea);
 		if (s.autoLinkShowNotice) {
-			new Notice(`画板粘贴自动双链：${n} 个文本元素（Ctrl+Z 可撤销）${hint}`);
+			const ext = this.countExtended(candidates);
+			const detail = ext > 0 ? `${n} 个文本元素 · 含补全 ${ext} 处` : `${n} 个文本元素`;
+			new Notice(`画板粘贴自动双链：${detail}（Ctrl+Z 可撤销）${hint}`);
 		}
 	}
 

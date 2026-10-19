@@ -64,6 +64,12 @@ export class LinkSuggestModal extends Modal {
 
 			const main = row.createDiv({ cls: "smart-linker-main" });
 			main.createSpan({ cls: "smart-linker-term", text: cand.text });
+			if (cand.occurrences.some((o) => o.link?.extended)) {
+				const badge = main.createSpan({ text: "补全" });
+				badge.style.cssText =
+					"font-size:11px;padding:0 6px;border-radius:8px;background:var(--background-modifier-hover);color:var(--text-muted);margin-left:6px;";
+				badge.setAttribute("title", "已有链接在原文位置上补全为更长的词，链接目标保持不变");
+			}
 			main.createSpan({ cls: "smart-linker-arrow", text: "→" });
 
 			if (cand.targets.length > 1) {

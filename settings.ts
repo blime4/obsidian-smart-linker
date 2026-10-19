@@ -255,6 +255,18 @@ export class SmartLinkerSettingTab extends PluginSettingTab {
 			.addToggle((t) => t.setValue(s.wholeWordLatin).onChange(async (v) => { s.wholeWordLatin = v; await this.plugin.saveSettings(); }));
 
 		new Setting(containerEl)
+			.setName("补全已有双链为最长匹配")
+			.setDesc(
+				[
+					"开启后，已有链接会和紧邻文字合并起来重新匹配，命中更长的词就改写。",
+					"例：DFlash.md 的别名里有「DFlash 2」，正文的 [[DFlash]] 2 会被补成 [[DFlash|DFlash 2]]；[[DFlash]]2 会补成 [[DFlash|DFlash2]]。",
+					"只改「链接目标不变」的情况：若更长的词指向另一篇笔记，会跳过并在弹窗里标出，不会悄悄改链接去向。",
+					"两端可见文字一致，所以渲染出来的文字完全不变，只是链接从半截变成完整词。",
+				].join("\n"),
+			)
+			.addToggle((t) => t.setValue(s.linkExtendToLongest).onChange(async (v) => { s.linkExtendToLongest = v; await this.plugin.saveSettings(); }));
+
+		new Setting(containerEl)
 			.setName("跳过特殊区域")
 			.setDesc("不在代码块、数学公式、已有 [[链接]]、Markdown 链接和 HTML 标签内创建链接（行内代码由下方开关单独控制）。")
 			.addToggle((t) => t.setValue(s.protectSpecialRanges).onChange(async (v) => { s.protectSpecialRanges = v; await this.plugin.saveSettings(); }));

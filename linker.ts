@@ -1,6 +1,6 @@
 import type { App, CachedMetadata, Editor, EditorPosition, TFile } from "obsidian";
 import type { IndexEntry, MatchCandidate, MatchOccurrence, Replacement, SmartLinkerSettings, WikilinkInfo } from "./types";
-import { computeProtectedRanges, escapeRegExp, isProtected, isWholeLatinWord, normalizeAliases, type Range } from "./utils";
+import { buildProjection, computeProtectedRanges, escapeRegExp, isProtected, isWholeLatinWord, mapProjectedRange, normalizeAliases, type Range } from "./utils";
 
 /** 扫描结果：候选链接列表 + 原文 + 扫描窗口。 */
 export interface ScanResult {
@@ -121,6 +121,24 @@ function dedupeTargets(targets: IndexEntry[]): IndexEntry[] {
 }
 
 /**
+ * 「补全已有双链」专用：把候选目标限制为「原链接本来就指向的那些文件」。
+ * 找不到可对应关系时返回 null（宁可不改，也不悄悄改链接去向）。
+ */
+function compatibleTargets(
+	index: Map<string, IndexEntry[]>,
+	linkTarget: string,
+	targets: IndexEntry[],
+	norm: (s: string) => string,
+): IndexEntry[] | null {
+	const base = linkTarget.split("/").pop() ?? linkTarget;
+	if (base === "") return null;
+	const current = index.get(norm(base)) ?? [];
+	const paths = new Set(current.map((e) => e.file.path));
+	const out = targets.filter((t) => paths.has(t.file.path) || t.noteName === base);
+	return out.length > 0 ? out : null;
+}
+
+/**
  * 核心：在给定文本上扫描可链接候选。
  * 可选 window 限定区间；可选 protect 跳过特殊区域；可选 source 标注来源（Excalidraw 元素等）。
  */
@@ -137,7 +155,9 @@ export function scanText(
 	const codeProtected =
 		protect && settings.linkInlineCode ? computeProtectedRanges(text, { excludeInlineCode: true }) : [];
 	const linkProtected =
-		protect && settings.fixBrokenLinks ? computeProtectedRanges(text, { excludeWikilinks: true }) : [];
+		(protect && settings.fixBrokenLinks) || settings.linkExtendToLongest
+			? computeProtectedRanges(text, { excludeWikilinks: true })
+			: [];
 	const norm = (s: string): string => (settings.caseSensitive ? s : s.toLowerCase());
 	const lowerText = settings.caseSensitive ? null : text.toLowerCase();
 
@@ -199,10 +219,41 @@ export function scanText(
 		}
 	}
 
+	// 已有双链补全为最长匹配：`[[DFlash]] 2` → `[[DFlash|DFlash 2]]`。
+	// 做法：把文档投影成「可见文字」后重新做最长匹配，再把命中区间映射回原文。
+	// 这样链接不会再把词切断，链接也能参与「最长优先」的竞争。
+	if (settings.linkExtendToLongest && text.includes("[[")) {
+		const proj = buildProjection(text);
+		const projLower = settings.caseSensitive ? null : proj.text.toLowerCase();
+		for (const [key, targets] of index) {
+			const present = projLower !== null ? projLower.indexOf(key) !== -1 : proj.text.indexOf(key) !== -1;
+			if (!present) continue;
+			for (const o of findOccurrences(proj.text, targets[0].term, settings)) {
+				const visible = proj.text.slice(o.from, o.to);
+				const mapped = mapProjectedRange(proj, o.from, o.to);
+				if (!mapped) continue;
+				// 必须正好覆盖一条链接：0 条＝纯文本（主扫描已处理），≥2 条＝会吞并其它链接
+				if (mapped.links.length !== 1) continue;
+				const link = mapped.links[0];
+				if (link.suffix !== "") continue; // 带 #标题 / ^块 的不动
+				if (visible === link.display) continue; // 没有变长，无需改写
+				// 只改「目标不变」的链接；指向别的笔记时宁可不动
+				const compatible = compatibleTargets(index, link.target, targets, norm);
+				if (!compatible) continue;
+				raw.push({
+					from: mapped.dFrom,
+					to: mapped.dTo,
+					key,
+					targets: compatible,
+					link: { embed: false, target: link.target, display: visible, suffix: "", extended: true },
+				});
+			}
+		}
+	}
+
 	const valid = raw.filter((o) => {
 		if (o.from < window[0] || o.to > window[1]) return false;
-		if (protectedRanges.length === 0) return true;
-		// 失效链接重写 / 行内代码整段命中要放行「自身所在区间」，但仍受其它区域保护
+		// 失效链接重写 / 补全已有链接 / 行内代码整段命中要放行「自身所在区间」，但仍受其它区域保护
 		const ranges = o.link ? linkProtected : o.inCode ? codeProtected : protectedRanges;
 		return !(ranges.length > 0 && isProtected(ranges, o.from, o.to));
 	});
@@ -222,10 +273,12 @@ export function scanText(
 
 	const byKey = new Map<string, MatchCandidate>();
 	for (const o of kept) {
-		let c = byKey.get(o.key);
+		// 补全项单独成组：它的目标被限定为「原链接指向的文件」，不能与同名的普通候选混在一起
+		const groupKey = o.link?.extended ? `${o.key}\u0000extend` : o.key;
+		let c = byKey.get(groupKey);
 		if (!c) {
 			c = { text: "", targets: dedupeTargets(o.targets), defaultTargetIndex: 0, occurrences: [], source: opts?.source };
-			byKey.set(o.key, c);
+			byKey.set(groupKey, c);
 		}
 		c.occurrences.push({ from: o.from, to: o.to, inCode: o.inCode, link: o.link });
 	}
@@ -233,8 +286,12 @@ export function scanText(
 	for (const c of byKey.values()) {
 		c.occurrences.sort((a, b) => a.from - b.from);
 		const first = c.occurrences[0];
-		// 行内代码整段命中的代表文字去掉反引号，便于弹窗展示
-		c.text = first.inCode ? text.substring(first.from + 1, first.to - 1) : text.substring(first.from, first.to);
+		// 代表性文字：补全项取命中的完整可见文字；行内代码去掉反引号；其余取原文片段
+		c.text = first.link?.extended
+			? (first.link.display ?? first.link.target)
+			: first.inCode
+				? text.substring(first.from + 1, first.to - 1)
+				: text.substring(first.from, first.to);
 		const nameIdx = c.targets.findIndex((t) => !t.isAlias);
 		c.defaultTargetIndex = nameIdx >= 0 ? nameIdx : 0;
 	}
@@ -291,13 +348,16 @@ export function buildReplacements(
 	for (const occ of candidate.occurrences) {
 		const inTable = opts.escapeTable !== false && isTableCellLine(text, occ.from, occ.to);
 		const sep = inTable ? "\\|" : "|";
-		// 已有 wikilink 的失效链接重写：整段替换为 [[新笔记名(后缀)|原显示]]
+		// 已有 wikilink 的失效链接重写 / 补全：整段替换为 [[新笔记名(后缀)|显示文字]]
 		if (occ.link) {
 			const display = occ.link.display ?? occ.link.target;
+			const bang = occ.link.embed ? "!" : "";
+			const dest = `${target.noteName}${occ.link.suffix}`;
 			out.push({
 				from: occ.from,
 				to: occ.to,
-				text: `${occ.link.embed ? "!" : ""}[[${target.noteName}${occ.link.suffix}${sep}${display}]]`,
+				// 显示文字与目标同名时不必写别名（Excalidraw 要求保留原文时除外）
+				text: display === dest && !opts.forceAlias ? `${bang}[[${dest}]]` : `${bang}[[${dest}${sep}${display}]]`,
 			});
 			continue;
 		}
